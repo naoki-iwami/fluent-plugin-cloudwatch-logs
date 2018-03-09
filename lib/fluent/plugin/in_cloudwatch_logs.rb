@@ -24,6 +24,10 @@ module Fluent
     config_param :log_group_name, :string
     config_param :log_stream_name, :string
     config_param :use_log_stream_name_prefix, :bool, default: false
+    config_param :order_by_latest_event, :bool, default: false
+    config_param :describe_limit, :integer, default: 50
+    config_param :disable_next_describe, :bool, default: false
+    config_param :delay_second, :integer, default: 0
     config_param :state_file, :string
     config_param :fetch_interval, :time, default: 60
     config_param :http_proxy, :string, default: nil
@@ -94,7 +98,7 @@ module Fluent
     end
 
     def run
-      @next_fetch_time = Time.now
+      @next_fetch_time = Time.now + @delay_second
 
       until @finished
         if Time.now > @next_fetch_time
@@ -108,6 +112,7 @@ module Fluent
               events.each do |event|
                 emit(log_stream_name, event)
               end
+              sleep 1
             end
           else
             events = get_events(@log_stream_name)
@@ -137,8 +142,14 @@ module Fluent
         log_stream_name: log_stream_name
       }
       request[:next_token] = next_token(log_stream_name) if next_token(log_stream_name)
-      response = @logs.get_log_events(request)
-      store_next_token(response.next_forward_token, log_stream_name)
+
+      begin
+        response = @logs.get_log_events(request)
+        store_next_token(response.next_forward_token, log_stream_name)
+      rescue => e
+        log.error "GET_LOG_EVENTS_ERROR #{e.message}"
+        return []
+      end
 
       response.events
     end
@@ -148,14 +159,19 @@ module Fluent
         log_group_name: @log_group_name
       }
       request[:next_token] = next_token if next_token
-      request[:log_stream_name_prefix] = @log_stream_name
+      request[:log_stream_name_prefix] = @log_stream_name if !@order_by_latest_event
+      request[:order_by] = 'LastEventTime' if @order_by_latest_event
+      request[:descending] = true if @order_by_latest_event
+      request[:limit] = @describe_limit
+      
       response = @logs.describe_log_streams(request)
       if log_streams
         log_streams.concat(response.log_streams)
       else
         log_streams = response.log_streams
       end
-      if response.next_token
+      if response.next_token && !@disable_next_describe
+        log.info "describe next: #@log_stream_name"
         log_streams = describe_log_streams(log_streams, response.next_token)
       end
       log_streams
